@@ -45,6 +45,10 @@ public static class Cli
             "start" => StartCommand(svc, args[1..], stdout),
             "stop" => StopCommand(svc, args[1..], stdout),
             "status" => StatusCommand(svc, stdout),
+            "log" => LogCommand(svc, args[1..], stdout),
+            "entries" => EntriesCommand(svc, args[1..], stdout),
+            "report" => ReportCommand(svc, args[1..], stdout),
+            "invoice" => InvoiceCommand(svc, args[1..], stdout),
             _ => throw new TrackerException($"Unknown command '{args[0]}'. Run without arguments to see usage."),
         };
     }
@@ -133,6 +137,124 @@ public static class Cli
         return 0;
     }
 
+    // ----- entries & reports -----
+
+    private static int LogCommand(TrackerService svc, string[] args, TextWriter out_)
+    {
+        if (args.Length < 3) throw new TrackerException("Usage: log <project> <start> <end> [--desc \"...\"] [--tags a,b] [--no-bill]\nTimes: \"2026-11-05 09:00\", \"2026-11-05T09:00\", or \"09:00\" for today.");
+        var opts = ParseOptions(args[3..]);
+        var start = ParseDateTime(args[1]);
+        var end = ParseDateTime(args[2]);
+        if (end <= start) throw new TrackerException("End time must be after start time.");
+        if (svc.RunningEntry() is { } running && running.ProjectId == svc.FindProject(args[0]).Id)
+            throw new TrackerException("A timer is already running on this project — stop it before logging a manual entry.");
+        var tags = opts.TryGetValue("tags", out var t) ? t.Split(',') : [];
+        var entry = svc.AddManualEntry(args[0], start, end, opts.GetValueOrDefault("desc", ""), tags, !opts.ContainsKey("no-bill"));
+        out_.WriteLine($"Logged {FormatDuration(entry.Duration(svc.Now))} on '{svc.FindProjectById(entry.ProjectId).Name}' ({start:yyyy-MM-dd HH:mm} – {end:HH:mm}).");
+        return 0;
+    }
+
+    private static int EntriesCommand(TrackerService svc, string[] args, TextWriter out_)
+    {
+        var opts = ParseOptions(args);
+        var (from, to) = ParseRange(opts);
+        Guid? projectId = opts.TryGetValue("project", out var p) ? svc.FindProject(p).Id : null;
+        Guid? clientId = opts.TryGetValue("client", out var c) ? svc.FindClient(c).Id : null;
+        var entries = new ReportService(svc.Data, svc).Entries(from, to, projectId, clientId);
+        if (entries.Count == 0) { out_.WriteLine("No entries in this range."); return 0; }
+        out_.WriteLine($"{"Started",-17} {"Project",-20} {"Duration",-10} Description");
+        foreach (var e in entries)
+        {
+            var project = svc.FindProjectById(e.ProjectId);
+            out_.WriteLine($"{e.Start:yyyy-MM-dd HH:mm}  {project.Name,-20} {(e.IsRunning ? "running" : FormatDuration(e.Duration(svc.Now))),-10} {(e.Billable ? "" : "[non-billable] ")}{e.Description}");
+        }
+        return 0;
+    }
+
+    private static int ReportCommand(TrackerService svc, string[] args, TextWriter out_)
+    {
+        var opts = ParseOptions(args);
+        var (from, to) = ParseRange(opts);
+        Guid? clientId = opts.TryGetValue("client", out var c) ? svc.FindClient(c).Id : null;
+        var summaries = new ReportService(svc.Data, svc).Summaries(from, to, clientId);
+        if (summaries.Count == 0) { out_.WriteLine("No tracked time in this range."); return 0; }
+        var label = from is null ? "All time" : $"{from:yyyy-MM-dd} – {to:yyyy-MM-dd}";
+        out_.WriteLine($"Billable report — {label}");
+        out_.WriteLine($"{"Project",-20} {"Client",-16} {"Hours",-8} {"Billable",-9} Amount");
+        decimal total = 0;
+        foreach (var s in summaries)
+        {
+            total += s.Amount;
+            out_.WriteLine($"{s.Project.Name,-20} {s.ClientName,-16} {s.Total.TotalHours,-8:0.##} {s.Billable.TotalHours,-9:0.##} {s.Amount:0.00}");
+        }
+        out_.WriteLine($"Total billable: {total:0.00}");
+        return 0;
+    }
+
+    private static int InvoiceCommand(TrackerService svc, string[] args, TextWriter out_)
+    {
+        var opts = ParseOptions(args);
+        if (!opts.TryGetValue("client", out var clientName)) throw new TrackerException("Usage: invoice --client <name> [--from <date>] [--to <date>] [--week|--month] [--csv <path>]");
+        var client = svc.FindClient(clientName);
+        var (from, to) = ParseRange(opts);
+        var lines = new ReportService(svc.Data, svc).InvoiceLines(client, from, to);
+        if (lines.Count == 0) { out_.WriteLine($"No finished entries for '{client.Name}' in this range."); return 0; }
+        var total = lines.Sum(l => l.Amount);
+        if (opts.TryGetValue("csv", out var csvPath))
+        {
+            CsvExporter.WriteInvoice(csvPath, client, lines, from, to);
+            out_.WriteLine($"Invoice for '{client.Name}': {lines.Count} entries, {total:0.00} {client.Currency} — wrote {csvPath}");
+            return 0;
+        }
+        out_.WriteLine($"Invoice — {client.Name} ({(from is null ? "all time" : $"{from:yyyy-MM-dd} – {to:yyyy-MM-dd}")})");
+        foreach (var line in lines)
+            out_.WriteLine($"{line.Entry.Start:yyyy-MM-dd HH:mm}  {line.Project.Name,-20} {FormatDuration(line.Entry.Duration(line.Entry.End!.Value)),-8} {line.Amount:0.00} {client.Currency}  {line.Entry.Description}");
+        out_.WriteLine($"Total: {total:0.00} {client.Currency}");
+        return 0;
+    }
+
+    // ----- date handling -----
+
+    /// <summary>Parses "2026-11-05 09:00", "2026-11-05T09:00", "2026-11-05" or a bare
+    /// "09:00" (today). Times are taken in local time.</summary>
+    public static DateTimeOffset ParseDateTime(string value)
+    {
+        var formats = new[] { "yyyy-MM-dd HH:mm", "yyyy-MM-ddTHH:mm", "yyyy-MM-dd", "HH:mm" };
+        if (DateTimeOffset.TryParseExact(value, formats, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeLocal, out var parsed))
+        {
+            if (value.Length == 5) // bare "HH:mm" parsed against today's date by TryParseExact
+                parsed = new DateTimeOffset(DateTime.Today.Add(parsed.TimeOfDay), TimeZoneInfo.Local.GetUtcOffset(DateTime.Today));
+            return parsed;
+        }
+        if (DateTimeOffset.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeLocal, out parsed)) return parsed;
+        throw new TrackerException($"Cannot parse time '{value}'. Use \"yyyy-MM-dd HH:mm\" or \"HH:mm\" for today.");
+    }
+
+    /// <summary>--from/--to dates, or --week (Mon–Sun) / --month shortcuts.
+    /// Date-only bounds cover the whole day; the range end is exclusive.</summary>
+    private static (DateTimeOffset? From, DateTimeOffset? To) ParseRange(Dictionary<string, string> opts)
+    {
+        if (opts.ContainsKey("week"))
+        {
+            var today = DateTime.Today;
+            var monday = today.AddDays(-(((int)today.DayOfWeek + 6) % 7));
+            return (StartOfDay(monday), StartOfDay(monday.AddDays(7)));
+        }
+        if (opts.ContainsKey("month"))
+        {
+            var first = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+            return (StartOfDay(first), StartOfDay(first.AddMonths(1)));
+        }
+        DateTimeOffset? from = opts.TryGetValue("from", out var f) ? StartOfDay(ParseDateTime(f).Date) : null;
+        DateTimeOffset? to = opts.TryGetValue("to", out var t) ? StartOfDay(ParseDateTime(t).Date.AddDays(1)) : null;
+        return (from, to);
+    }
+
+    private static DateTimeOffset StartOfDay(DateTime date) =>
+        new(date, TimeZoneInfo.Local.GetUtcOffset(date));
+
     // ----- helpers -----
 
     /// <summary>Parses --key value / --key=value pairs and bare --flags.</summary>
@@ -191,6 +313,13 @@ public static class Cli
                                                                 Start the timer
               stop [--desc "..."]                               Stop the timer
               status                                            Show the running timer
+              log <project> <start> <end> [--desc "..."]       Log a finished block
+              entries [--project <name>] [--client <name>] [--from <date>] [--to <date>]
+                                                                List time entries
+              report [--client <name>] [--from <date>] [--to <date>] [--week|--month]
+                                                                Billable summary by project
+              invoice --client <name> [--from <date>] [--to <date>] [--week|--month] [--csv <path>]
+                                                                Per-entry invoice, optionally as CSV
             """);
     }
 }

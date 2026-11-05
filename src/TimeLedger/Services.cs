@@ -20,6 +20,9 @@ public sealed class TrackerService
 
     public DateTimeOffset Now => _now();
 
+    /// <summary>The underlying data document (exposed read-only for reporting).</summary>
+    public DataFile Data => _data;
+
     // ----- Clients -----
 
     public Client AddClient(string name, decimal hourlyRate, string currency = "USD")
@@ -149,5 +152,31 @@ public sealed class TrackerService
         if (description is not null) stopped = stopped with { Description = description };
         _data.Entries[_data.Entries.IndexOf(running)] = stopped;
         return (stopped, now - running.Start);
+    }
+
+    /// <summary>Records a finished block of time after the fact (e.g. work done
+    /// away from the keyboard). Manual entries never overlap the running timer.</summary>
+    public TimeEntry AddManualEntry(string projectRef, DateTimeOffset start, DateTimeOffset end,
+        string description, IEnumerable<string> tags, bool billable)
+    {
+        if (end <= start) throw new TrackerException("End time must be after start time.");
+        var project = FindProject(projectRef);
+        if (project.Archived) throw new TrackerException($"Project '{project.Name}' is archived.");
+        var overlap = _data.Entries.Any(e =>
+            e.ProjectId == project.Id &&
+            start < (e.End ?? _now()) && (e.Start < end));
+        if (overlap) throw new TrackerException("That block overlaps an existing entry for this project.");
+        var entry = new TimeEntry
+        {
+            Id = Guid.NewGuid(),
+            ProjectId = project.Id,
+            Description = description,
+            Start = start,
+            End = end,
+            Billable = billable,
+            Tags = tags.Select(t => t.Trim()).Where(t => t.Length > 0).ToList(),
+        };
+        _data.Entries.Add(entry);
+        return entry;
     }
 }
