@@ -1,0 +1,17 @@
+## Build output
+bin/
+obj/
+out/
+
+## .NET
+*.user
+*.suo
+.vs/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Local data (never commit a real time log)
+.timeledger/
+*.json.tmp-*
